@@ -1,0 +1,3072 @@
+#-----------------------------------------------
+# Setup conda environment for Hi-C analysis
+#-----------------------------------------------
+ 
+# Create a dedicated conda environment
+conda create -n hic_analysis python=3.9
+ 
+# Activate the newly created environment
+conda activate hic_analysis
+ 
+# Configure conda channels in order of priority
+conda config --add channels defaults       # Standard packages
+conda config --add channels bioconda       # Bioinformatics packages
+conda config --add channels conda-forge    # Community-maintained packages
+conda config --set channel_priority strict # Prevent package conflicts
+ 
+# Install essential tools for Hi-C analysis	
+conda install -y \
+wget \
+git \
+samtools \
+fastqc \
+trim-galore \
+bwa \
+openjdk \
+gcc \
+make \
+gawk \
+parallel
+
+conda install -c conda-forge -c bioconda sra-tools=3.2.1
+#-----------------------------------------------
+# Install Juicer and its dependencies
+#-----------------------------------------------
+ 
+# Create a directory for all Hi-C analysis tools
+mkdir -p ~/hic_tools
+cd ~/hic_tools
+ 
+# Clone the Juicer repository
+git clone https://github.com/aidenlab/juicer.git
+cd juicer
+ 
+# Create necessary directory structure for Juicer 2.0
+mkdir -p scripts/common
+cp CPU/*.* scripts/common
+cp CPU/common/* scripts/common
+ 
+# Download Juicer Tools JAR file
+wget https://github.com/aidenlab/Juicebox/releases/download/v2.17.00/juicer_tools_2.17.00.jar
+ 
+# Create symbolic link with the expected name
+mv juicer_tools_2.17.00.jar scripts/common/juicer_tools.jar
+
+#-----------------------------------------------
+# Prepare reference genome and restriction sites
+#-----------------------------------------------
+ 
+# Create directories for reference data
+mkdir -p /mnt/d/hic/hic_references/hg38
+cd /mnt/d/hic/hic_references/hg38
+
+
+#=============================================
+# Download and prepare reference genome
+#=============================================
+ 
+# Download the reference genome
+#wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
+wget -c https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
+gunzip hg38.fa.gz
+ 
+# Create BWA index for the reference genome
+bwa index hg38.fa
+ 
+#=============================================
+# Generate restriction enzyme sites
+#=============================================
+ 
+# Create a comprehensive script to generate all common Hi-C restriction enzyme sites
+cat > generate_restriction_sites.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Generate restriction enzyme cut sites for all commonly used Hi-C enzymes
+"""
+ 
+import re
+import os
+ 
+# Common restriction enzymes used in Hi-C experiments
+HIC_ENZYMES = {
+    'MboI': 'GATC',           # 4-base cutter, most common for high-resolution Hi-C
+    'DpnII': 'GATC',          # 4-base cutter, same recognition as MboI
+    'HindIII': 'AAGCTT',      # 6-base cutter, good for genome-wide overview
+    'NcoI': 'CCATGG',         # 6-base cutter
+    'BglII': 'AGATCT',        # 6-base cutter
+    'EcoRI': 'GAATTC',        # 6-base cutter
+    'BamHI': 'GGATCC',        # 6-base cutter
+    'XhoI': 'CTCGAG',         # 6-base cutter
+    'SacI': 'GAGCTC',         # 6-base cutter
+    'KpnI': 'GGTACC',         # 6-base cutter
+    'SalI': 'GTCGAC',         # 6-base cutter
+    'SpeI': 'ACTAGT',         # 6-base cutter
+    'XbaI': 'TCTAGA',         # 6-base cutter
+    'NheI': 'GCTAGC',         # 6-base cutter
+    'AluI': 'AGCT',           # 4-base cutter
+    'Sau3AI': 'GATC',         # 4-base cutter, same as MboI/DpnII
+    'TaqI': 'TCGA',           # 4-base cutter
+    'MseI': 'TTAA',           # 4-base cutter
+    'CviQI': 'GTAC',          # 4-base cutter
+    'HaeIII': 'GGCC'          # 4-base cutter
+}
+ 
+def find_restriction_sites(fasta_file, enzyme_name, enzyme_seq, output_file):
+    """
+    Find all restriction enzyme cut sites in the genome
+    """
+    sites = []
+    current_chr = None
+    current_pos = 0
+    sequence_buffer = ""
+ 
+    with open(fasta_file, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if line.startswith('>'):
+                # Process any remaining sequence in buffer
+                if sequence_buffer and current_chr:
+                    for match in re.finditer(enzyme_seq, sequence_buffer.upper()):
+                        pos = current_pos + match.start() + 1  # 1-based coordinate
+                        sites.append(f"{current_chr}\t{pos}")
+ 
+                # New chromosome
+                current_chr = line[1:].split()[0]  # Take only chromosome name
+                current_pos = 0
+                sequence_buffer = ""
+            else:
+                # DNA sequence - add to buffer
+                sequence_buffer += line.upper()
+ 
+                # Process buffer when it gets large enough
+                if len(sequence_buffer) > 1000000:  # Process in 1MB chunks
+                    # Find sites in current buffer
+                    for match in re.finditer(enzyme_seq, sequence_buffer):
+                        pos = current_pos + match.start() + 1  # 1-based coordinate
+                        sites.append(f"{current_chr}\t{pos}")
+ 
+                    # Keep overlap region for sites spanning chunks
+                    overlap = len(enzyme_seq) - 1
+                    current_pos += len(sequence_buffer) - overlap
+                    sequence_buffer = sequence_buffer[-overlap:]
+ 
+    # Process final buffer
+    if sequence_buffer and current_chr:
+        for match in re.finditer(enzyme_seq, sequence_buffer):
+            pos = current_pos + match.start() + 1  # 1-based coordinate
+            sites.append(f"{current_chr}\t{pos}")
+ 
+    # Write restriction sites to file
+    with open(output_file, 'w') as f:
+        f.write(f"# Restriction sites for {enzyme_name} ({enzyme_seq})\n")
+        f.write(f"# Format: chromosome<tab>position\n")
+        f.write(f"# Total sites found: {len(sites)}\n")
+        for site in sites:
+            f.write(site + '\n')
+ 
+    return len(sites)
+ 
+def generate_all_restriction_sites(fasta_file):
+    """Generate restriction sites for all Hi-C enzymes"""
+ 
+    if not os.path.exists(fasta_file):
+        print(f"Error: Reference genome file not found: {fasta_file}")
+        return
+ 
+    total_enzymes = len(HIC_ENZYMES)
+    results = {}
+ 
+    for i, (enzyme_name, enzyme_seq) in enumerate(HIC_ENZYMES.items(), 1):
+        output_file = f"hg38_{enzyme_name}.txt"
+        site_count = find_restriction_sites(fasta_file, enzyme_name, enzyme_seq, output_file)
+        results[enzyme_name] = site_count
+ 
+if __name__ == "__main__":
+    # Generate sites for the reference genome
+    fasta_file = 'hg38.fa'
+    generate_all_restriction_sites(fasta_file)
+EOF
+ 
+# Make the script executable
+chmod +x generate_restriction_sites.py
+ 
+# Run the script to generate all restriction sites
+python3 generate_restriction_sites.py
+ 
+#=============================================
+# Create chromosome sizes file
+#=============================================
+ 
+# Extract chromosome sizes from the FASTA file
+samtools faidx hg38.fa
+cut -f1,2 hg38.fa.fai > hg38.chrom.sizes
+
+#-----------------------------------------------
+# Download and examine example Hi-C data
+#-----------------------------------------------
+# Create project directory structure
+mkdir -p /mnt/d/hic/hic_project/{raw_data,trimmed_data,fastq}
+cd /mnt/d/hic/hic_project/raw_data
+
+# Download example Hi-C dataset (GSE63525) #Option: 1 or 2
+
+#Option: 1
+prefetch --max-size u SRR1658570
+fasterq-dump --split-files --threads 8 SRR1658570
+gzip *.fastq
+
+#Option: 2
+https://www.ebi.ac.uk/ena/browser/view/SRR1658570 
+
+#-----------------------------------------------
+# Quality control and preprocessing
+#-----------------------------------------------
+ 
+#=============================================
+# Initial quality assessment
+#=============================================
+ 
+# Run FastQC on the raw data
+mkdir -p /mnt/d/hic/hic_project/qc_reports/raw
+fastqc /mnt/d/hic/hic_project/raw_data/*.fastq.gz -o /mnt/d/hic/hic_project/qc_reports/raw -t 8
+ 
+#=============================================
+# Adapter trimming and quality filtering
+#=============================================
+ 
+# Trim adapters and low-quality bases
+trim_galore \
+  --paired \
+  --quality 20 \
+  --stringency 3 \
+  --length 20 \
+  --fastqc \
+  --cores 8 \
+  --output_dir /mnt/d/hic/hic_project/trimmed_data \
+  /mnt/d/hic/hic_project/raw_data/SRR1658570_1.fastq.gz \
+  /mnt/d/hic/hic_project/raw_data/SRR1658570_2.fastq.gz
+  
+#-----------------------------------------------
+# Prepare input files for Juicer
+#-----------------------------------------------
+ 
+# Uncompress and rename files to Juicer's expected format
+gunzip -c /mnt/d/hic/hic_project/trimmed_data/SRR1658570_1_val_1.fq.gz > /mnt/d/hic/hic_project/fastq/SRR1658570_R1.fastq
+gunzip -c /mnt/d/hic/hic_project/trimmed_data/SRR1658570_2_val_2.fq.gz > /mnt/d/hic/hic_project/fastq/SRR1658570_R2.fastq
+
+
+#-----------------------------------------------
+# : Run Juicer pipeline
+#-----------------------------------------------
+ 
+# Set key variables for the analysis
+GENOME="hg38"
+REFERENCE_DIR="/mnt/d/hic/hic_references/hg38"
+RESTRICTION_SITE="MboI"
+RESTRICTION_FILE="/mnt/d/hic/hic_references/hg38/hg38_MboI.txt"
+CHROM_SIZES="/mnt/d/hic/hic_references/hg38/hg38.chrom.sizes"
+THREADS=8
+ 
+bash ~/hic_tools/juicer/scripts/common/juicer.sh \
+  -D ~/hic_tools/juicer \
+  -d /mnt/d/hic/hic_project \
+  -g ${GENOME} \
+  -s ${RESTRICTION_SITE} \
+  -p ${CHROM_SIZES} \
+  -y ${RESTRICTION_FILE} \
+  -z ${REFERENCE_DIR}/hg38.fa \
+  -t ${THREADS}
+  
+  
+# Validate the generated Hi-C file
+java -Xmx32g -jar ~/hic_tools/juicer/scripts/common/juicer_tools.jar validate \
+    ~/hic_project/aligned/inter_30.hic
+	
+	
+#-----------------------------------------------
+# TAD detection using Arrowhead algorithm
+#-----------------------------------------------
+java -Xmx32g -jar ~/hic_tools/juicer/scripts/common/juicer_tools arrowhead \
+    -c chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX \
+    -m 5000 \
+    -r 25000 \
+    -k SCALE \
+    /mnt/d/hic/hic_project/aligned/inter_30.hic \
+    /mnt/d/hic/hic_project/aligned/tads_genome_wide
+
+ls -lh /mnt/d/hic/hic_project/aligned/tads_genome_wide/25000_blocks.bedpe
+wc -l /mnt/d/hic/hic_project/aligned/tads_genome_wide/25000_blocks.bedpe
+
+# Convert BEDPE TAD output to BED format for Juicebox visualization
+awk 'NR>1 {print $1"\t"$2"\t"$6"\tTAD_"NR-1"\t1000\t."}' \
+/mnt/d/hic/hic_project/aligned/tads_genome_wide/25000_blocks.bedpe \
+> /mnt/d/hic/hic_project/aligned/tad_domains_25kb.bed
+	
+head /mnt/d/hic/hic_project/aligned/tad_domains_25kb.bed
+ls -lh /mnt/d/hic/hic_project/aligned/tads_genome_wide
+ls -lh /mnt/d/hic/hic_project/aligned/tad_domains_25kb.bed
+
+#-----------------------------------------------
+# Extract contact matrices and perform compartment analysis
+#-----------------------------------------------
+ 
+#=============================================
+# Extract Contact Matrices for Detailed Analysis
+#=============================================
+ ~/hic_tools/juicer/scripts/common/juicer_tools dump \
+    observed SCALE \
+    /mnt/d/hic/hic_project/aligned/inter_30.hic \
+    chr1 chr1 \
+    BP 25000 \
+    /mnt/d/hic/hic_project/aligned/chr1_contacts_25kb.txt
+	
+ls -lh /mnt/d/hic/hic_project/aligned/chr1_contacts_25kb.txt
+
+head /mnt/d/hic/hic_project/aligned/chr1_contacts_25kb.txt
+	
+# Extract chromosome 1 contact matrix (alternative format for full chromosome)
+~/hic_tools/juicer/scripts/common/juicer_tools dump \
+    observed SCALE \
+    /mnt/d/hic/hic_project/aligned/inter_30.hic \
+    chr1 chr1 \
+    BP 25000 \
+    /mnt/d/hic/hic_project/aligned/chr1_25kb.txt
+	
+#!/usr/bin/env bash
+
+# ============================================================
+# Hi-C DOWNSTREAM ANALYSIS PIPELINE
+# ============================================================
+#
+# PURPOSE:
+#   1. A/B compartment analysis
+#   2. Pearson correlation analysis
+#   3. Chromatin loop detection
+#   4. Loop-anchor extraction
+#   5. Gene/promoter/enhancer/CTCF annotation
+#   6. Loop-level annotation integration
+#   7. Overlap-aware anchor classification
+#   8. CTCF association
+#   9. Regulatory burden analysis
+#  10. Final QC
+#
+# MAIN TOOLS:
+#   FAN-C
+#   Juicer Tools
+#   BEDTools
+#   GENCODE v38
+#   ENCODE SCREEN cCREs
+#
+# GENOME:
+#   hg38
+#
+# ANALYSIS:
+#   Chromosome 1
+#
+# ============================================================
+
+
+# ============================================================
+# SETUP
+# ============================================================
+## New Enviornment
+mamba create -n fanc37 python=3.7 -y
+# Activate the FAN-C environment used for Hi-C downstream analysis.
+conda activate fanc37
+
+mamba install -c conda-forge -c bioconda fanc -y
+fanc --version
+pip install Deprecated	
+	
+mkdir -p /mnt/d/hic/hic_project/downstream/fanc
+
+# Define directories so that paths do not need to be repeatedly written.
+HIC="/mnt/d/hic/hic_project/aligned"
+FANC="/mnt/d/hic/hic_project/downstream/fanc"
+LOOPS="/mnt/d/hic/hic_project/downstream/loops"
+
+# Reference annotation files.
+GTF="/mnt/d/hic/hic_references/gencode.v38.annotation.gtf"
+CCRE="$LOOPS/GRCh38-cCREs.bed"
+
+# Create output directories if they do not already exist.
+mkdir -p "$FANC"
+mkdir -p "$LOOPS"
+
+
+# ============================================================
+# A/B COMPARTMENT ANALYSIS
+# ============================================================
+
+# ------------------------------------------------------------
+# Convert the Juicer .hic contact map into FAN-C format.
+#
+# Resolution:
+#   100 kb
+#
+# Biological purpose:
+#   A/B compartments describe broad-scale chromatin organization.
+#
+# A compartment:
+#   Generally associated with active/open chromatin.
+#
+# B compartment:
+#   Generally associated with inactive/compact chromatin.
+# ------------------------------------------------------------
+
+# Convert Juicer .hic → FAN-C at 100-kb resolution
+fanc to-fanc \
+    "$HIC/inter_30.hic@100000@SCALE" \
+    "$FANC/inter_30_100kb.fanc"
+
+
+# ------------------------------------------------------------
+# Calculate A/B compartments using FAN-C.
+# ------------------------------------------------------------
+
+fanc compartments \
+    "$FANC/inter_30_100kb.fanc" \
+    "$FANC/compartments_100kb"
+
+ls -lh /mnt/d/hic/hic_project/downstream/fanc
+
+# ------------------------------------------------------------
+# Export the compartment eigenvector values.
+#
+# Output:
+#   AB_compartments_100kb.bed
+#
+# Note:
+#   Eigenvector sign itself is arbitrary. The orientation should
+#   be interpreted using biological/reference information rather
+#   than assuming positive automatically means A.
+# ------------------------------------------------------------
+
+fanc compartments \
+    "$FANC/compartments_100kb" \
+    -v "$FANC/AB_compartments_100kb.bed"
+
+
+# ------------------------------------------------------------
+# Export continuous compartment domains.
+# ------------------------------------------------------------
+
+fanc compartments \
+    "$FANC/compartments_100kb" \
+    -d "$FANC/AB_domains_100kb.bed"
+# ------------------------------------------------------------
+# Calculate compartment strength.
+#
+# Biological purpose:
+#   Measures the strength of compartmental segregation.
+# ------------------------------------------------------------
+
+fanc compartments \
+    "$FANC/inter_30_100kb.fanc" \
+    "$FANC/compartments_100kb" \
+    --compartment-strength \
+    "$FANC/compartment_strength_100kb.txt"
+
+# ------------------------------------------------------------
+# Generate compartment enrichment profile.
+# ------------------------------------------------------------
+
+fanc compartments \
+    "$FANC/inter_30_100kb.fanc" \
+    "$FANC/compartments_100kb" \
+    -e "$FANC/enrichment_profile_100kb.pdf"
+
+
+
+#Final output files#
+inter_30_100kb.fanc
+compartments_100kb
+AB_compartments_100kb.bed
+AB_domains_100kb.bed
+compartment_strength_100kb.txt
+enrichment_profile_100kb.pdf
+
+# ============================================================
+# COMPARTMENT VISUALIZATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Visualize chromosome 1 with the Hi-C contact map and
+# A/B compartment track.
+# ------------------------------------------------------------
+
+fancplot chr1 \
+    -o "$FANC/chr1_AB_compartments.pdf" \
+    --plot triangular "$FANC/inter_30_100kb.fanc" \
+    --plot bar "$FANC/AB_compartments_100kb.bed"
+
+# ------------------------------------------------------------
+# Zoom into the first 50 Mb of chromosome 1.
+# ------------------------------------------------------------
+
+fancplot chr1:1-50000000 \
+    -o "$FANC/chr1_1_50Mb_AB.pdf" \
+    --plot triangular "$FANC/inter_30_100kb.fanc" \
+    --plot bar "$FANC/AB_compartments_100kb.bed"
+
+# ------------------------------------------------------------
+# Visualize continuous compartment domains.
+# Plot compartment domains
+# ------------------------------------------------------------
+
+fancplot chr1:1-50000000 \
+    -o "$FANC/chr1_AB_domains.pdf" \
+    --plot triangular "$FANC/inter_30_100kb.fanc" \
+    --plot layer "$FANC/AB_domains_100kb.bed"
+
+
+# ============================================================
+# PEARSON CORRELATION ANALYSIS
+# ============================================================
+
+# ------------------------------------------------------------
+# Generate a Pearson correlation matrix at 100-kb resolution.
+#
+# Biological purpose:
+#   Pearson correlation transforms the contact matrix into a
+#   similarity/correlation matrix that highlights compartmental
+#   organization.
+#
+# Expected pattern:
+#   Similar compartment regions → positive correlation
+#   Different compartment regions → negative correlation
+# ------------------------------------------------------------
+
+~/hic_tools/juicer/scripts/common/juicer_tools pearsons \
+    SCALE \
+    "$HIC/inter_30.hic" \
+    chr1 \
+    BP \
+    100000 \
+    "$HIC/chr1_pearsons_100kb.txt"
+
+# Note: Pearson correlation reveals compartmental organization
+#       - Strong positive correlations indicate same compartment type
+#       - Negative correlations indicate different compartment types
+#       - Creates characteristic plaid pattern in heatmaps
+# ============================================================
+# CONVERT Hi-C DATA FOR LOOP ANALYSIS
+# ============================================================
+
+# ------------------------------------------------------------
+# Convert the .hic file to FAN-C format at 25-kb resolution.
+#
+# Why higher resolution?
+#   Chromatin loops are smaller-scale structures than A/B
+#   compartments, so a finer resolution is used.
+# ------------------------------------------------------------
+
+fanc to-fanc \
+    "$HIC/inter_30.hic@25000@SCALE" \
+    "$FANC/inter_30.fanc"
+
+
+# ============================================================
+# LOOP DETECTION
+# ============================================================
+
+# ------------------------------------------------------------
+# Detect chromatin loops on chromosome 1.
+#
+# Parameters:
+#
+#   --peak-size 1
+#       Defines the local peak size.
+#
+#   --neighborhood-width 4
+#       Defines the surrounding neighborhood used during
+#       loop detection.
+#
+#   --min-distance 2
+#       Minimum genomic separation between loop anchors.
+#
+#   --fdr 0.1
+#       False-discovery-rate threshold.
+#
+#   --observed 5
+#       Minimum observed interaction requirement.
+#
+#   --merge-pixels
+#       Merge nearby significant pixels representing the same
+#       interaction.
+#
+#   --merge-distance 20000
+#       Maximum distance for merging nearby loop calls.
+#
+#   --remove-singlets
+#       Removes isolated/single-pixel calls.
+#
+# Output:
+#   BEDPE file containing two anchors for every detected loop.
+# ------------------------------------------------------------
+
+fanc loops \
+    "$FANC/inter_30.fanc" \
+    "$LOOPS/inter_30_chr1_loops" \
+    --chromosomes chr1 \
+    --threads 8 \
+    --peak-size 1 \
+    --neighborhood-width 4 \
+    --min-distance 2 \
+    --fdr 0.1 \
+    --observed 5 \
+    --merge-pixels \
+    --merge-distance 20000 \
+    --remove-singlets \
+    --bedpe "$LOOPS/inter_30_chr1_loops.bedpe" \
+    --force-overwrite
+
+
+# ============================================================
+# EXTRACT LOOP ANCHORS
+# ============================================================
+
+head -20 \
+/mnt/d/hic/hic_project/downstream/loops/inter_30_chr1_loops.bedpe
+
+wc -l \
+/mnt/d/hic/hic_project/downstream/loops/inter_30_chr1_loops.bedpe
+
+# ------------------------------------------------------------
+# BEDPE contains coordinates for both sides of each loop.
+#
+# Anchor 1:
+#   columns 1-3
+#
+# Anchor 2:
+#   columns 4-6
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"} {
+    print $1,$2,$3
+}' "$LOOPS/inter_30_chr1_loops.bedpe" \
+> "$LOOPS/chr1_loop_anchor1.bed"
+
+
+awk 'BEGIN{OFS="\t"} {
+    print $4,$5,$6
+}' "$LOOPS/inter_30_chr1_loops.bedpe" \
+> "$LOOPS/chr1_loop_anchor2.bed"
+
+# Check the anchors
+head -10 /mnt/d/hic/hic_project/downstream/loops/chr1_loop_anchor1.bed
+head -10 /mnt/d/hic/hic_project/downstream/loops/chr1_loop_anchor2.bed
+
+wc -l /mnt/d/hic/hic_project/downstream/loops/chr1_loop_anchor1.bed
+wc -l /mnt/d/hic/hic_project/downstream/loops/chr1_loop_anchor2.bed
+
+# Visualize a detected loop: Take one loop from the BEDPE
+head -1 \
+/mnt/d/hic/hic_project/downstream/loops/inter_30_chr1_loops.bedpe
+# ------------------------------------------------------------
+# Remove duplicate coordinates within each anchor set.
+# ------------------------------------------------------------
+
+sort -k1,1 -k2,2n -k3,3n \
+    "$LOOPS/chr1_loop_anchor1.bed" |
+uniq \
+> "$LOOPS/chr1_loop_anchor1_unique.bed"
+
+
+sort -k1,1 -k2,2n -k3,3n \
+    "$LOOPS/chr1_loop_anchor2.bed" |
+uniq \
+> "$LOOPS/chr1_loop_anchor2_unique.bed"
+
+
+# ------------------------------------------------------------
+# Create one non-redundant BED file containing all loop anchors.
+#
+# This file is used for general annotation/QC.
+# Anchor1 and Anchor2 files are retained because later analysis
+# must preserve which annotation belongs to which anchor.
+# ------------------------------------------------------------
+
+cat \
+    "$LOOPS/chr1_loop_anchor1_unique.bed" \
+    "$LOOPS/chr1_loop_anchor2_unique.bed" |
+sort -k1,1 -k2,2n -k3,3n |
+uniq \
+> "$LOOPS/chr1_all_loop_anchors.bed"
+
+
+
+wc -l /mnt/d/hic/hic_project/downstream/loops/chr1_all_loop_anchors.bed
+
+#Visualize a detected loop (first loop)
+head -1 /mnt/d/hic/hic_project/downstream/loops/inter_30_chr1_loops.bedpe
+
+# Visualize a detected loop: visualize a larger surrounding region
+fancplot chr1:23000000-24000000 \
+    -o /mnt/d/hic/hic_project/downstream/loops/chr1_loop_example.pdf \
+    --plot triangular \
+    /mnt/d/hic/hic_project/downstream/fanc/inter_30.fanc
+	
+	
+	
+# ============================================================
+# CREATE LOOP IDs
+# ============================================================
+
+# ------------------------------------------------------------
+# Add a unique Loop_ID to every detected loop.
+#
+# This is important because annotation files initially contain
+# genomic coordinates but do not retain the original loop ID.
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"}
+{
+    print NR,$1,$2,$3,$4,$5,$6
+}' "$LOOPS/inter_30_chr1_loops.bedpe" \
+> "$LOOPS/chr1_loops_with_ids.bedpe"
+
+
+# ------------------------------------------------------------
+# Create the master loop table.
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Loop_ID",
+          "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "Anchor2_chr","Anchor2_start","Anchor2_end"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7
+}' "$LOOPS/chr1_loops_with_ids.bedpe" \
+> "$LOOPS/chr1_loop_master.tsv"
+
+
+# ============================================================
+# GENE ANNOTATION
+# ============================================================
+## hg38 annotation BED/GTF file is required
+## Download:https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/gencode.v38.annotation.gtf.gz
+
+# Input
+LOOPS="/mnt/d/hic/hic_project/downstream/loops"
+GTF="/mnt/d/hic/hic_references/gencode.v38.annotation.gtf"
+
+# ------------------------------------------------------------
+# Extract chromosome 1 gene records from GENCODE v38.
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"}
+$1=="chr1" && $3=="gene" {
+    print
+}' "$GTF" \
+> "$LOOPS/chr1_gencode_genes.gtf"
+
+# OR #______________Extract gene annotations from GENCODE for the entire genome______________#
+awk 'BEGIN{OFS="\t"} 
+$3=="gene" {
+    print
+}' "$GTF" \
+> "$LOOPS/gencode_genes.gtf"
+# ------------------------------------------------------------
+# Convert GENCODE gene records from GTF to BED.
+#
+# Output fields:
+#   chromosome
+#   start
+#   end
+#   gene ID
+#   gene name
+#   gene type
+# ------------------------------------------------------------
+
+head "$LOOPS/chr1_gencode_genes.gtf"
+
+#Convert GENCODE gene GTF → BED
+awk 'BEGIN{OFS="\t"}
+$1=="chr1" && $3=="gene" {
+
+    attrs=$9
+
+    for(i=10;i<=NF;i++)
+        attrs=attrs" "$i
+
+    gene_id="NA"
+    gene_name="NA"
+    gene_type="NA"
+
+    if (match(attrs,/gene_id "[^"]+"/))
+        gene_id=substr(attrs,RSTART+9,RLENGTH-10)
+
+    if (match(attrs,/gene_name "[^"]+"/))
+        gene_name=substr(attrs,RSTART+11,RLENGTH-12)
+
+    if (match(attrs,/gene_type "[^"]+"/))
+        gene_type=substr(attrs,RSTART+11,RLENGTH-12)
+
+    print $1,$4-1,$5,gene_id,gene_name,gene_type
+
+}' "$GTF" \
+> "$LOOPS/chr1_gencode_genes.bed"
+
+head "$LOOPS/chr1_gencode_genes.bed"
+# ============================================================
+# PROMOTER ANNOTATION
+# ============================================================
+
+# ------------------------------------------------------------
+#---------------- Gencode Promoter----------------#
+# Define a promoter as TSS ± 2 kb.
+#
+# Strand-specific TSS:
+#   + strand → start coordinate
+#   - strand → end coordinate
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"}
+$1=="chr1" && $3=="gene" {
+
+    attrs=$9
+
+    for(i=10;i<=NF;i++)
+        attrs=attrs" "$i
+
+    gene_id="NA"
+    gene_name="NA"
+
+    if (match(attrs,/gene_id "[^"]+"/))
+        gene_id=substr(attrs,RSTART+9,RLENGTH-10)
+
+    if (match(attrs,/gene_name "[^"]+"/))
+        gene_name=substr(attrs,RSTART+11,RLENGTH-12)
+
+    if ($7=="+")
+        tss=$4
+    else if ($7=="-")
+        tss=$5
+    else
+        next
+
+    start=tss-2000
+    if (start<1)
+        start=1
+
+    end=tss+2000
+
+    print $1,start-1,end,gene_id,gene_name,$7
+
+}' "$GTF" \
+> "$LOOPS/chr1_promoters_2kb.bed"
+
+head "$LOOPS/chr1_promoters_2kb.bed"
+
+# ============================================================
+# ENCODE cCRE ANNOTATION
+# ============================================================
+
+# Download: https://downloads.wenglab.org/V3/GRCh38-cCREs.bed
+
+CCRE="/mnt/d/hic/hic_project/downstream/loops/GRCh38-cCREs.bed"
+
+# ------------------------------------------------------------
+# Extract chromosome 1 cis-regulatory elements from ENCODE
+# SCREEN cCRE annotation.
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"} $1=="chr1"' \
+    "$CCRE" \
+> "$LOOPS/chr1_ccres.bed"
+
+
+cut -f6 "$LOOPS/chr1_ccres.bed" | sort | uniq -c | sort -nr
+cut -f6 "$LOOPS/chr1_ccres.bed" | sort -u
+
+# ------------------------------------------------------------------------------------
+| SCREEN class               |  Count | Interpretation for our pipeline            |
+| -------------------------- | -----: | ------------------------------------------ |
+| `dELS`                     | 45,094 | **Distal enhancer-like**                   |
+| `dELS,CTCF-bound`          | 26,147 | **Distal enhancer + CTCF**                 |
+| `pELS`                     |  7,482 | **Proximal enhancer-like**                 |
+| `pELS,CTCF-bound`          |  9,386 | **Proximal enhancer + CTCF**               |
+| `PLS`                      |    827 | Promoter-like sites                        |
+| `PLS,CTCF-bound`           |  2,989 | Promoter-like sites + CTCF                 |
+| `CTCF-only,CTCF-bound`     |  2,975 | **CTCF**                                   |
+| `DNase-H3K4me3`            |  1,336 | Regulatory, but not classified as enhancer |
+| `DNase-H3K4me3,CTCF-bound` |    704 | Regulatory + CTCF                          |
+# ------------------------------------------------------------------------------------
+
+## enhancer extraction (dELS/dELS,CTCF-bound/pELS/pELS,CTCF-bound)
+awk 'BEGIN{OFS="\t"}
+$6 ~ /(^|,)dELS(,|$)/ ||
+$6 ~ /(^|,)pELS(,|$)/ {
+    print
+}' "$LOOPS/chr1_ccres.bed" \
+> "$LOOPS/chr1_enhancers.bed"
+
+cut -f6 "$LOOPS/chr1_enhancers.bed" | sort | uniq -c | sort -nr
+
+# ------------------------------------------------------------
+# Extract promoter-like cCREs.
+#
+# Included:
+#   PLS
+#   PLS,CTCF-bound
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"}
+$6 ~ /(^|,)PLS(,|$)/ {
+    print
+}' "$LOOPS/chr1_ccres.bed" \
+> "$LOOPS/chr1_cCRE_promoters.bed"
+
+cut -f6 "$LOOPS/chr1_cCRE_promoters.bed" | sort | uniq -c | sort -nr
+
+# ------------------------------------------------------------
+# Extract CTCF-associated cCREs.
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t"}
+$6 ~ /CTCF-bound/ {
+    print
+}' "$LOOPS/chr1_ccres.bed" \
+> "$LOOPS/chr1_CTCF.bed"
+
+cut -f6 "$LOOPS/chr1_CTCF.bed" | sort | uniq -c | sort -nr
+
+# ============================================================
+# ANNOTATE ANCHOR 1 AND ANCHOR 2
+# ============================================================
+#
+# IMPORTANT:
+# We retain Anchor 1 and Anchor 2 separately.
+#
+# This is necessary because we ultimately want to distinguish:
+#
+#     Anchor 1 = promoter
+#     Anchor 2 = enhancer
+#
+# from:
+#
+#     Anchor 1 = enhancer
+#     Anchor 2 = promoter
+#
+# and determine whether either anchor contains multiple
+# regulatory annotations.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# GENES
+# ------------------------------------------------------------
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor1.bed" \
+    -b "$LOOPS/chr1_gencode_genes.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor1_genes.txt"
+
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor2.bed" \
+    -b "$LOOPS/chr1_gencode_genes.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor2_genes.txt"
+
+head -20 "$LOOPS/chr1_anchor1_genes.txt" | column -t
+head -20 "$LOOPS/chr1_anchor2_genes.txt" | column -t
+# ------------------------------------------------------------
+# GENCODE PROMOTERS
+# ------------------------------------------------------------
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor1.bed" \
+    -b "$LOOPS/chr1_promoters_2kb.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor1_promoters.txt"
+
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor2.bed" \
+    -b "$LOOPS/chr1_promoters_2kb.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor2_promoters.txt"
+
+head -20 "$LOOPS/chr1_anchor1_promoters.txt" | column -t
+head -20 "$LOOPS/chr1_anchor2_promoters.txt" | column -t
+# ------------------------------------------------------------
+# cCRE PROMOTERS
+# ------------------------------------------------------------
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor1.bed" \
+    -b "$LOOPS/chr1_cCRE_promoters.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor1_cCRE_promoters.txt"
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor2.bed" \
+    -b "$LOOPS/chr1_cCRE_promoters.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor2_cCRE_promoters.txt"
+
+head -20 "$LOOPS/chr1_anchor1_cCRE_promoters.txt" | column -t
+head -20 "$LOOPS/chr1_anchor2_cCRE_promoters.txt" | column -t
+
+# ------------------------------------------------------------
+# ENHANCERS
+# ------------------------------------------------------------
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor1.bed" \
+    -b "$LOOPS/chr1_enhancers.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor1_enhancers.txt"
+
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor2.bed" \
+    -b "$LOOPS/chr1_enhancers.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor2_enhancers.txt"
+
+head -20 "$LOOPS/chr1_anchor1_enhancers.txt" | column -t
+head -20 "$LOOPS/chr1_anchor2_enhancers.txt" | column -t 
+
+# ------------------------------------------------------------
+# CTCF
+# ------------------------------------------------------------
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor1.bed" \
+    -b "$LOOPS/chr1_CTCF.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor1_CTCF.txt"
+
+
+bedtools intersect \
+    -a "$LOOPS/chr1_loop_anchor2.bed" \
+    -b "$LOOPS/chr1_CTCF.bed" \
+    -wa -wb \
+> "$LOOPS/chr1_anchor2_CTCF.txt"
+
+head -20 "$LOOPS/chr1_anchor1_CTCF.txt" | column -t
+head -20 "$LOOPS/chr1_anchor2_CTCF.txt" | column -t
+
+cd "$LOOPS"
+# Summarise
+ls -lh \
+chr1_anchor1_genes.txt \
+chr1_anchor2_genes.txt \
+chr1_anchor1_promoters.txt \
+chr1_anchor2_promoters.txt \
+chr1_anchor1_enhancers.txt \
+chr1_anchor2_enhancers.txt \
+chr1_anchor1_CTCF.txt \
+chr1_anchor2_CTCF.txt
+
+wc -l \
+chr1_anchor1_genes.txt \
+chr1_anchor2_genes.txt \
+chr1_anchor1_promoters.txt \
+chr1_anchor2_promoters.txt \
+chr1_anchor1_enhancers.txt \
+chr1_anchor2_enhancers.txt \
+chr1_anchor1_CTCF.txt \
+chr1_anchor2_CTCF.txt
+
+# ============================================================
+# ADD LOOP IDs TO ANCHOR ANNOTATIONS
+# ============================================================
+
+# ------------------------------------------------------------
+# The BEDTools intersections contain anchor coordinates but
+# not Loop_ID.
+#
+# The following step maps:
+#
+#     anchor coordinates → Loop_ID
+#
+# so every annotation can be linked back to its original loop.
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# Function:
+# Add Loop_ID to an annotation table.
+#
+# Arguments:
+#   1 = anchor-loop mapping file
+#   2 = BEDTools annotation file
+#   3 = output file
+# ------------------------------------------------------------
+
+add_loop_id() {
+
+    MAP="$1"
+    ANNOT="$2"
+    OUT="$3"
+    HEADER="$4"
+
+    awk -v HEADER="$HEADER" 'BEGIN{OFS="\t"}
+
+    NR==FNR {
+
+        if (NR>1)
+            loop[$2 FS $3 FS $4]=$1
+
+        next
+    }
+
+    NR==1 {
+
+        print HEADER
+
+        next
+    }
+
+    {
+
+        key=$1 FS $2 FS $3
+
+        if (key in loop)
+            print loop[key],$0
+
+    }' "$MAP" "$ANNOT" > "$OUT"
+}
+
+
+# ------------------------------------------------------------
+# Create coordinate lookup tables.
+# ------------------------------------------------------------
+
+awk 'BEGIN{OFS="\t";
+print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end"}
+{
+print $1,$2,$3,$4
+}' "$LOOPS/chr1_loops_with_ids.bedpe" \
+> "$LOOPS/chr1_anchor1_loop_map.tsv"
+
+
+awk 'BEGIN{OFS="\t";
+print "Loop_ID","Anchor2_chr","Anchor2_start","Anchor2_end"}
+{
+print $1,$5,$6,$7
+}' "$LOOPS/chr1_loops_with_ids.bedpe" \
+> "$LOOPS/chr1_anchor2_loop_map.tsv"
+
+# ============================================================
+# ANCHOR ANNOTATION QC
+# ============================================================
+
+cd /mnt/d/hic/hic_project/downstream/loops
+
+# Check number of unique Anchor 1 coordinates annotated with genes
+echo "===== Anchor 1 gene annotation QC ====="
+
+cut -f1-3 chr1_anchor1_genes.txt | sort -u | wc -l
+
+echo "Total unique Anchor 1 coordinates:"
+sort -u chr1_loop_anchor1.bed | wc -l
+
+
+# Check number of unique Anchor 2 coordinates annotated with genes
+echo
+echo "===== Anchor 2 gene annotation QC ====="
+
+cut -f1-3 chr1_anchor2_genes.txt | sort -u | wc -l
+
+echo "Total unique Anchor 2 coordinates:"
+sort -u chr1_loop_anchor2.bed | wc -l
+
+
+# Total number of detected loops
+echo
+echo "===== Total Chr1 loops ====="
+
+wc -l inter_30_chr1_loops.bedpe
+
+
+# ============================================================
+# INSPECT ANNOTATION FILES
+# ============================================================
+
+echo
+echo "===== Anchor 1 genes ====="
+head -3 chr1_anchor1_genes.txt | column -t
+
+echo
+echo "===== Anchor 2 genes ====="
+head -3 chr1_anchor2_genes.txt | column -t
+
+echo
+echo "===== Anchor 1 promoters ====="
+head -3 chr1_anchor1_promoters.txt | column -t
+
+echo
+echo "===== Anchor 2 promoters ====="
+head -3 chr1_anchor2_promoters.txt | column -t
+
+echo
+echo "===== Anchor 1 enhancers ====="
+head -3 chr1_anchor1_enhancers.txt | column -t
+
+echo
+echo "===== Anchor 2 enhancers ====="
+head -3 chr1_anchor2_enhancers.txt | column -t
+
+echo
+echo "===== Anchor 1 CTCF ====="
+head -3 chr1_anchor1_CTCF.txt | column -t
+
+echo
+echo "===== Anchor 2 CTCF ====="
+head -3 chr1_anchor2_CTCF.txt | column -t
+
+echo
+echo "===== Anchor 1 cCRE promoters ====="
+head -3 chr1_anchor1_cCRE_promoters.txt | column -t
+
+echo
+echo "===== Anchor 2 cCRE promoters ====="
+head -3 chr1_anchor2_cCRE_promoters.txt | column -t
+
+
+# ============================================================
+# CLEAN ANNOTATION FILES
+# ============================================================
+
+# ------------------------------------------------------------
+# Gene annotations
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "Gene_chr","Gene_start","Gene_end",
+          "Gene_ID","Gene_name","Gene_type"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_genes.txt \
+> chr1_anchor1_genes_clean.txt
+
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor2_chr","Anchor2_start","Anchor2_end",
+          "Gene_chr","Gene_start","Gene_end",
+          "Gene_ID","Gene_name","Gene_type"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_genes.txt \
+> chr1_anchor2_genes_clean.txt
+
+
+# ------------------------------------------------------------
+# GENCODE promoter annotations
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "Promoter_chr","Promoter_start","Promoter_end",
+          "Gene_ID","Gene_name","Strand"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_promoters.txt \
+> chr1_anchor1_promoters_clean.txt
+
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor2_chr","Anchor2_start","Anchor2_end",
+          "Promoter_chr","Promoter_start","Promoter_end",
+          "Gene_ID","Gene_name","Strand"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_promoters.txt \
+> chr1_anchor2_promoters_clean.txt
+
+
+# ------------------------------------------------------------
+# Enhancer annotations
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "Enhancer_chr","Enhancer_start","Enhancer_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_enhancers.txt \
+> chr1_anchor1_enhancers_clean.txt
+
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor2_chr","Anchor2_start","Anchor2_end",
+          "Enhancer_chr","Enhancer_start","Enhancer_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_enhancers.txt \
+> chr1_anchor2_enhancers_clean.txt
+
+
+# ------------------------------------------------------------
+# CTCF annotations
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "CTCF_chr","CTCF_start","CTCF_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_CTCF.txt \
+> chr1_anchor1_CTCF_clean.txt
+
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor2_chr","Anchor2_start","Anchor2_end",
+          "CTCF_chr","CTCF_start","CTCF_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_CTCF.txt \
+> chr1_anchor2_CTCF_clean.txt
+
+
+# ------------------------------------------------------------
+# cCRE promoter annotations
+# ------------------------------------------------------------
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor1_chr","Anchor1_start","Anchor1_end",
+          "cCRE_chr","cCRE_start","cCRE_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_cCRE_promoters.txt \
+> chr1_anchor1_cCRE_promoters_clean.txt
+
+
+awk 'BEGIN{
+    OFS="\t";
+    print "Anchor2_chr","Anchor2_start","Anchor2_end",
+          "cCRE_chr","cCRE_start","cCRE_end",
+          "cCRE_ID","Element_ID","Classification"
+}
+{
+    print $1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_cCRE_promoters.txt \
+> chr1_anchor2_cCRE_promoters_clean.txt
+
+
+# ============================================================
+# FINAL CHECK
+# ============================================================
+
+echo
+echo "===== Clean annotation files created ====="
+
+ls -lh \
+chr1_anchor1_genes_clean.txt \
+chr1_anchor2_genes_clean.txt \
+chr1_anchor1_promoters_clean.txt \
+chr1_anchor2_promoters_clean.txt \
+chr1_anchor1_enhancers_clean.txt \
+chr1_anchor2_enhancers_clean.txt \
+chr1_anchor1_CTCF_clean.txt \
+chr1_anchor2_CTCF_clean.txt \
+chr1_anchor1_cCRE_promoters_clean.txt \
+chr1_anchor2_cCRE_promoters_clean.txt
+
+
+# ============================================================
+# LOOP-LEVEL ANNOTATION TABLES
+# ============================================================
+# ------------------------------------------------------------
+# attach Loop_ID to the gene annotations
+# ------------------------------------------------------------
+cd /mnt/d/hic/hic_project/downstream/loops
+
+         ## Anchor 1
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end","Gene_chr","Gene_start","Gene_end","Gene_ID","Gene_name","Gene_type"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_loop_map.tsv chr1_anchor1_genes_clean.txt \
+> chr1_loop_anchor1_genes.tsv
+
+head -10 chr1_loop_anchor1_genes.tsv | column -t
+
+
+         ## Anchor 2
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor2_chr","Anchor2_start","Anchor2_end","Gene_chr","Gene_start","Gene_end","Gene_ID","Gene_name","Gene_type"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_loop_map.tsv chr1_anchor2_genes_clean.txt \
+> chr1_loop_anchor2_genes.tsv
+
+head -10 chr1_loop_anchor2_genes.tsv | column -t
+
+
+# ------------------------------------------------------------
+# attach Loop_ID to the promoter annotations
+# ------------------------------------------------------------
+
+         ## Anchor 1
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end","Promoter_chr","Promoter_start","Promoter_end","Gene_ID","Gene_name","Strand"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_loop_map.tsv chr1_anchor1_promoters_clean.txt \
+> chr1_loop_anchor1_promoters.tsv
+
+head -10 chr1_loop_anchor1_promoters.tsv | column -t
+
+
+         ## Anchor 2
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor2_chr","Anchor2_start","Anchor2_end","Promoter_chr","Promoter_start","Promoter_end","Gene_ID","Gene_name","Strand"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_loop_map.tsv chr1_anchor2_promoters_clean.txt \
+> chr1_loop_anchor2_promoters.tsv
+
+head -10 chr1_loop_anchor2_promoters.tsv | column -t
+
+
+# ------------------------------------------------------------
+# attach Loop_ID to the cCRE promoter annotations
+# ------------------------------------------------------------
+         ## Anchor 1
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end","cCRE_chr","cCRE_start","cCRE_end","cCRE_ID","Element_ID","Classification"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_loop_map.tsv chr1_anchor1_cCRE_promoters_clean.txt \
+> chr1_loop_anchor1_cCRE_promoters.tsv
+
+head -10 chr1_loop_anchor1_cCRE_promoters.tsv | column -t
+
+
+         ## Anchor 2
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_loop_map.tsv chr1_anchor2_cCRE_promoters_clean.txt \
+> chr1_loop_anchor2_cCRE_promoters.tsv
+
+head -10 chr1_loop_anchor2_cCRE_promoters.tsv | column -t
+
+# ------------------------------------------------------------
+# attach Loop_ID to the enhancer annotations
+# ------------------------------------------------------------
+
+         ## Anchor 1
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end","Enhancer_chr","Enhancer_start","Enhancer_end","cCRE_ID","Element_ID","Classification"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_loop_map.tsv chr1_anchor1_enhancers_clean.txt \
+> chr1_loop_anchor1_enhancers.tsv
+
+head -10 chr1_loop_anchor1_enhancers.tsv | column -t
+
+
+         ## Anchor 2
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor2_chr","Anchor2_start","Anchor2_end","Enhancer_chr","Enhancer_start","Enhancer_end","cCRE_ID","Element_ID","Classification"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_loop_map.tsv chr1_anchor2_enhancers_clean.txt \
+> chr1_loop_anchor2_enhancers.tsv
+
+head -10 chr1_loop_anchor2_enhancers.tsv | column -t
+
+
+# ------------------------------------------------------------
+# attach Loop_ID to the CTCF annotations
+# ------------------------------------------------------------
+
+         ## Anchor 1
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+NR==1 {
+    print "Loop_ID","Anchor1_chr","Anchor1_start","Anchor1_end","CTCF_chr","CTCF_start","CTCF_end","cCRE_ID","Element_ID","Classification"
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor1_loop_map.tsv chr1_anchor1_CTCF_clean.txt \
+> chr1_loop_anchor1_CTCF.tsv
+
+head -10 chr1_loop_anchor1_CTCF.tsv | column -t
+
+
+         ## Anchor 2
+awk 'BEGIN{OFS="\t"}
+NR==FNR {
+    if (NR>1)
+        loop[$2 FS $3 FS $4]=$1
+    next
+}
+{
+    key=$1 FS $2 FS $3
+    if (key in loop)
+        print loop[key],$1,$2,$3,$4,$5,$6,$7,$8,$9
+}' chr1_anchor2_loop_map.tsv chr1_anchor2_CTCF_clean.txt \
+> chr1_loop_anchor2_CTCF.tsv
+
+head -10 chr1_loop_anchor2_CTCF.tsv | column -t
+
+# ------------------------------------------------------------
+# how many unique loops have each type of annotation
+# ------------------------------------------------------------
+echo "Anchor1 genes:"
+cut -f1 chr1_loop_anchor1_genes.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor2 genes:"
+cut -f1 chr1_loop_anchor2_genes.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor1 promoters:"
+cut -f1 chr1_loop_anchor1_promoters.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor2 promoters:"
+cut -f1 chr1_loop_anchor2_promoters.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor1 enhancers:"
+cut -f1 chr1_loop_anchor1_enhancers.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor2 enhancers:"
+cut -f1 chr1_loop_anchor2_enhancers.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor1 CTCF:"
+cut -f1 chr1_loop_anchor1_CTCF.tsv | tail -n +2 | sort -u | wc -l
+
+echo "Anchor2 CTCF:"
+cut -f1 chr1_loop_anchor2_CTCF.tsv | tail -n +2 | sort -u | wc -l
+
+# ============================================================
+# COUNT ANNOTATIONS PER LOOP
+# ============================================================
+
+# ------------------------------------------------------------
+# Count unique genes, promoters, cCRE promoters, enhancers and
+# CTCF elements associated with each anchor of every loop.
+#
+# Zero is assigned later to loops without an annotation.
+# ------------------------------------------------------------
+
+
+# ------------------------- GENES -----------------------------
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor1_genes.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor1_gene_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor1_gene_counts.tsv"
+
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor2_genes.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor2_gene_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor2_gene_counts.tsv"
+
+
+# ----------------------- PROMOTERS ---------------------------
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor1_promoters.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor1_promoter_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor1_promoter_counts.tsv"
+
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor2_promoters.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor2_promoter_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor2_promoter_counts.tsv"
+
+
+# --------------------- cCRE PROMOTERS ------------------------
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor1_cCRE_promoters.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor1_cCRE_promoter_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor1_cCRE_promoter_counts.tsv"
+
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor2_cCRE_promoters.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor2_cCRE_promoter_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor2_cCRE_promoter_counts.tsv"
+
+
+# ----------------------- ENHANCERS ---------------------------
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor1_enhancers.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor1_enhancer_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor1_enhancer_counts.tsv"
+
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor2_enhancers.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor2_enhancer_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor2_enhancer_counts.tsv"
+
+
+# -------------------------- CTCF -----------------------------
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor1_CTCF.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor1_CTCF_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor1_CTCF_counts.tsv"
+
+
+awk 'BEGIN{OFS="\t"}
+NR>1 {print $1,$8}' \
+"$LOOPS/chr1_loop_anchor2_CTCF.tsv" |
+sort -u |
+awk 'BEGIN{OFS="\t"}
+{count[$1]++}
+END{
+print "Loop_ID","Anchor2_CTCF_count";
+for(i in count) print i,count[i]
+}' |
+sort -n -k1,1 \
+> "$LOOPS/chr1_anchor2_CTCF_counts.tsv"
+
+
+# ============================================================
+# INTEGRATE ALL ANNOTATIONS
+# ============================================================
+
+# ------------------------------------------------------------
+# Combine the loop coordinates and all annotation counts into
+# one master table.
+#
+# Every loop receives a value for:
+#
+#   Anchor 1 genes
+#   Anchor 2 genes
+#   Anchor 1 promoters
+#   Anchor 2 promoters
+#   Anchor 1 cCRE promoters
+#   Anchor 2 cCRE promoters
+#   Anchor 1 enhancers
+#   Anchor 2 enhancers
+#   Anchor 1 CTCF
+#   Anchor 2 CTCF
+#
+# Missing annotations are assigned 0.
+# ------------------------------------------------------------
+
+cd "$LOOPS"
+
+awk 'BEGIN{OFS="\t"}
+
+FILENAME=="chr1_anchor1_gene_counts.tsv" {
+    if(FNR>1) A1gene[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor2_gene_counts.tsv" {
+    if(FNR>1) A2gene[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor1_promoter_counts.tsv" {
+    if(FNR>1) A1prom[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor2_promoter_counts.tsv" {
+    if(FNR>1) A2prom[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor1_cCRE_promoter_counts.tsv" {
+    if(FNR>1) A1ccre[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor2_cCRE_promoter_counts.tsv" {
+    if(FNR>1) A2ccre[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor1_enhancer_counts.tsv" {
+    if(FNR>1) A1enh[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor2_enhancer_counts.tsv" {
+    if(FNR>1) A2enh[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor1_CTCF_counts.tsv" {
+    if(FNR>1) A1ctcf[$1]=$2
+    next
+}
+
+FILENAME=="chr1_anchor2_CTCF_counts.tsv" {
+    if(FNR>1) A2ctcf[$1]=$2
+    next
+}
+
+FILENAME=="chr1_loop_master.tsv" {
+
+    if(FNR==1){
+
+        print "Loop_ID",
+              "Anchor1_chr","Anchor1_start","Anchor1_end",
+              "Anchor2_chr","Anchor2_start","Anchor2_end",
+              "Anchor1_gene_count","Anchor2_gene_count",
+              "Anchor1_promoter_count","Anchor2_promoter_count",
+              "Anchor1_cCRE_promoter_count","Anchor2_cCRE_promoter_count",
+              "Anchor1_enhancer_count","Anchor2_enhancer_count",
+              "Anchor1_CTCF_count","Anchor2_CTCF_count"
+
+        next
+    }
+
+    id=$1
+
+    print id,
+          $2,$3,$4,
+          $5,$6,$7,
+
+          (id in A1gene ? A1gene[id] : 0),
+          (id in A2gene ? A2gene[id] : 0),
+
+          (id in A1prom ? A1prom[id] : 0),
+          (id in A2prom ? A2prom[id] : 0),
+
+          (id in A1ccre ? A1ccre[id] : 0),
+          (id in A2ccre ? A2ccre[id] : 0),
+
+          (id in A1enh ? A1enh[id] : 0),
+          (id in A2enh ? A2enh[id] : 0),
+
+          (id in A1ctcf ? A1ctcf[id] : 0),
+          (id in A2ctcf ? A2ctcf[id] : 0)
+}
+
+' \
+chr1_anchor1_gene_counts.tsv \
+chr1_anchor2_gene_counts.tsv \
+chr1_anchor1_promoter_counts.tsv \
+chr1_anchor2_promoter_counts.tsv \
+chr1_anchor1_cCRE_promoter_counts.tsv \
+chr1_anchor2_cCRE_promoter_counts.tsv \
+chr1_anchor1_enhancer_counts.tsv \
+chr1_anchor2_enhancer_counts.tsv \
+chr1_anchor1_CTCF_counts.tsv \
+chr1_anchor2_CTCF_counts.tsv \
+chr1_loop_master.tsv \
+> chr1_loop_integrated_summary.tsv
+
+# Check Loop 
+awk -F'\t' 'NR==1 || $1==1' chr1_loop_integrated_summary.tsv | column -t
+
+# Check Loop 2
+awk -F'\t' 'NR==1 || $1==2' chr1_loop_integrated_summary.tsv | column -t
+
+head -10 chr1_loop_integrated_summary.tsv | column -t
+wc -l chr1_loop_integrated_summary.tsv
+
+# Check whether zeros were correctly assigned
+
+awk -F'\t' 'NR>1 {
+    if ($8==0) a1gene++;
+    if ($9==0) a2gene++;
+    if ($10==0) a1prom++;
+    if ($11==0) a2prom++;
+    if ($12==0) a1ccre++;
+    if ($13==0) a2ccre++;
+    if ($14==0) a1enh++;
+    if ($15==0) a2enh++;
+    if ($16==0) a1ctcf++;
+    if ($17==0) a2ctcf++;
+}
+END {
+    print "No Anchor1 gene:",a1gene;
+    print "No Anchor2 gene:",a2gene;
+    print "No Anchor1 promoter:",a1prom;
+    print "No Anchor2 promoter:",a2prom;
+    print "No Anchor1 cCRE promoter:",a1ccre;
+    print "No Anchor2 cCRE promoter:",a2ccre;
+    print "No Anchor1 enhancer:",a1enh;
+    print "No Anchor2 enhancer:",a2enh;
+    print "No Anchor1 CTCF:",a1ctcf;
+    print "No Anchor2 CTCF:",a2ctcf;
+}' chr1_loop_integrated_summary.tsv
+
+
+# ============================================================
+# BINARY ANNOTATION STATUS
+# ============================================================
+
+# ------------------------------------------------------------
+# Convert annotation counts into binary YES/NO-style indicators.
+#
+# 1 = annotation present
+# 0 = annotation absent
+#
+# This makes downstream classification easier.
+# ------------------------------------------------------------
+
+awk -F'\t' 'BEGIN{OFS="\t"}
+
+NR==1 {
+
+    print $0,
+          "Anchor1_has_gene",
+          "Anchor2_has_gene",
+          "Anchor1_has_promoter",
+          "Anchor2_has_promoter",
+          "Anchor1_has_cCRE_promoter",
+          "Anchor2_has_cCRE_promoter",
+          "Anchor1_has_enhancer",
+          "Anchor2_has_enhancer",
+          "Anchor1_has_CTCF",
+          "Anchor2_has_CTCF"
+
+    next
+}
+
+{
+
+    print $0,
+
+    ($8>0 ? 1 : 0),
+    ($9>0 ? 1 : 0),
+
+    ($10>0 ? 1 : 0),
+    ($11>0 ? 1 : 0),
+
+    ($12>0 ? 1 : 0),
+    ($13>0 ? 1 : 0),
+
+    ($14>0 ? 1 : 0),
+    ($15>0 ? 1 : 0),
+
+    ($16>0 ? 1 : 0),
+    ($17>0 ? 1 : 0)
+}
+
+' chr1_loop_integrated_summary.tsv \
+> chr1_loop_annotation_binary.tsv
+
+head -5 chr1_loop_annotation_binary.tsv | column -t
+wc -l chr1_loop_annotation_binary.tsv
+
+# ============================================================
+# OVERLAP-AWARE ANCHOR CLASSIFICATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Classify each anchor independently.
+#
+# P   = promoter
+# E   = enhancer
+# P+E = promoter AND enhancer
+# O   = no promoter or enhancer annotation
+#
+# IMPORTANT:
+# P+E is preserved as its own category.
+# ------------------------------------------------------------
+
+awk -F'\t' 'BEGIN{OFS="\t"}
+
+NR==1 {
+
+    print $0,
+          "Anchor1_type",
+          "Anchor2_type",
+          "Anchor_pair_class"
+
+    next
+}
+
+{
+
+    # --------------------------------------------------------
+    # Anchor 1
+    # --------------------------------------------------------
+
+    A1P=($10>0 || $12>0)
+    A1E=($14>0)
+
+    if(A1P && A1E)
+        A1="P+E"
+    else if(A1P)
+        A1="P"
+    else if(A1E)
+        A1="E"
+    else
+        A1="O"
+
+
+    # --------------------------------------------------------
+    # Anchor 2
+    # --------------------------------------------------------
+
+    A2P=($11>0 || $13>0)
+    A2E=($15>0)
+
+    if(A2P && A2E)
+        A2="P+E"
+    else if(A2P)
+        A2="P"
+    else if(A2E)
+        A2="E"
+    else
+        A2="O"
+
+
+    # --------------------------------------------------------
+    # OVERLAP-AWARE ANCHOR-PAIR CLASSIFICATION
+    # --------------------------------------------------------
+
+    # P+E -- P+E
+    if(A1=="P+E" && A2=="P+E")
+        pair="P+E-P+E"
+
+    # P+E -- P
+    else if((A1=="P+E" && A2=="P") ||
+            (A1=="P" && A2=="P+E"))
+        pair="P+E-P"
+
+    # P+E -- E
+    else if((A1=="P+E" && A2=="E") ||
+            (A1=="E" && A2=="P+E"))
+        pair="P+E-E"
+
+    # P+E -- O
+    else if((A1=="P+E" && A2=="O") ||
+            (A1=="O" && A2=="P+E"))
+        pair="P+E-O"
+
+    # P -- P
+    else if(A1=="P" && A2=="P")
+        pair="PP"
+
+    # P -- E or E -- P
+    else if((A1=="P" && A2=="E") ||
+            (A1=="E" && A2=="P"))
+        pair="PE"
+
+    # E -- E
+    else if(A1=="E" && A2=="E")
+        pair="EE"
+
+    # P -- O or O -- P
+    else if((A1=="P" && A2=="O") ||
+            (A1=="O" && A2=="P"))
+        pair="P-O"
+
+    # E -- O or O -- E
+    else if((A1=="E" && A2=="O") ||
+            (A1=="O" && A2=="E"))
+        pair="E-O"
+
+    # O -- O
+    else
+        pair="O-O"
+
+
+    print $0,A1,A2,pair
+
+}
+
+' chr1_loop_integrated_summary.tsv \
+> chr1_loop_anchor_pair_classified.tsv
+
+head -10 chr1_loop_anchor_pair_classified.tsv | column -t
+# ============================================================
+# CTCF STATUS
+# ============================================================
+
+# ------------------------------------------------------------
+# A loop is classified as CTCF+ if either anchor contains
+# a CTCF-associated cCRE.
+#
+# CTCF+ = at least one anchor has CTCF
+# CTCF- = neither anchor has CTCF
+# ------------------------------------------------------------
+
+awk -F'\t' 'BEGIN{OFS="\t"}
+
+NR==1 {
+
+    print $0,"CTCF_status"
+
+    next
+}
+
+{
+
+    if(($16>0) || ($17>0))
+        ctcf="CTCF+"
+    else
+        ctcf="CTCF-"
+
+    print $0,ctcf
+
+}' chr1_loop_anchor_pair_classified.tsv \
+> chr1_loop_anchor_pair_CTCF_classified.tsv
+
+
+# ============================================================
+# ANCHOR-PAIR DISTRIBUTION
+# ============================================================
+
+# ------------------------------------------------------------
+# Calculate the number and percentage of loops belonging to
+# each anchor-pair category.
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR>1 {
+    count[$27]++
+    total++
+}
+
+END {
+
+    print "AnchorPair\tCount\tPercentage"
+
+    for(pair in count)
+        printf "%s\t%d\t%.2f\n",
+               pair,
+               count[pair],
+               100*count[pair]/total
+
+}' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort -k1,1 \
+> chr1_anchor_pair_distribution.tsv
+
+
+# ============================================================
+# ANCHOR-PAIR × CTCF SUMMARY
+# ============================================================
+
+# ------------------------------------------------------------
+# Determine how frequently CTCF-positive loops occur in each
+# anchor-pair class.
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR>1 {
+
+    pair=$27
+    ctcf=$28
+
+    total[pair]++
+
+    if(ctcf=="CTCF+")
+        positive[pair]++
+}
+
+END {
+
+    print "AnchorPair\tTotal_loops\tCTCF_positive\tCTCF_negative\tCTCF_positive_%"
+
+    for(pair in total){
+
+        n=total[pair]
+        pos=positive[pair]+0
+        neg=n-pos
+
+        printf "%s\t%d\t%d\t%d\t%.2f\n",
+               pair,n,pos,neg,100*pos/n
+    }
+
+}' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort -k1,1 \
+> chr1_anchor_pair_CTCF_summary.tsv
+
+
+# ============================================================
+# OVERLAP-AWARE ANCHOR TYPE DISTRIBUTION
+# ============================================================
+
+# ------------------------------------------------------------
+# Count functional states of individual loop anchors.
+#
+# P
+# E
+# P+E
+# O
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR>1 {
+
+    count[$25]++
+    count[$26]++
+
+    total+=2
+}
+
+END {
+
+    print "Functional_Status\tAnchor_Count\tPercentage"
+
+    for(type in count)
+        printf "%s\t%d\t%.2f\n",
+               type,
+               count[type],
+               100*count[type]/total
+
+}' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort \
+> chr1_overlap_aware_anchor_types.tsv
+
+
+# ============================================================
+# OVERLAP-AWARE ANCHOR TYPE DISTRIBUTION
+# ============================================================
+
+# ------------------------------------------------------------
+# Count functional states of individual loop anchors.
+#
+# P   = promoter
+# E   = enhancer
+# P+E = promoter AND enhancer
+# O   = other/no promoter or enhancer annotation
+#
+# IMPORTANT:
+# Anchor1_type = column 18
+# Anchor2_type = column 19
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR>1 {
+
+    # Anchor 1
+    count[$18]++
+
+    # Anchor 2
+    count[$19]++
+
+    # Two anchors per loop
+    total+=2
+}
+
+END {
+
+    print "Functional_Status\tAnchor_Count\tPercentage"
+
+    for(type in count)
+        printf "%s\t%d\t%.2f\n",
+               type,
+               count[type],
+               100*count[type]/total
+
+}' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort -k1,1 \
+> chr1_overlap_aware_anchor_types.tsv
+
+# ============================================================
+# OVERLAP-AWARE REGULATORY BURDEN
+# ============================================================
+
+# ------------------------------------------------------------
+# Summarize the total and average number of regulatory elements
+# associated with each overlap-aware anchor-pair category.
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR>1 {
+
+    # --------------------------------------------------------
+    # Overlap-aware anchor pair
+    #
+    # $18 = Anchor1_type
+    # $19 = Anchor2_type
+    # --------------------------------------------------------
+
+    pair=$18 "-" $19
+
+    loops[pair]++
+
+    # Gene burden
+    genes[pair]+=$8+$9
+
+    # Promoter burden
+    promoters[pair]+=$10+$11
+
+    # cCRE promoter burden
+    ccre[pair]+=$12+$13
+
+    # Enhancer burden
+    enhancers[pair]+=$14+$15
+
+    # CTCF burden
+    ctcf[pair]+=$16+$17
+}
+
+END {
+
+    print "AnchorPair\tLoops\tTotal_genes\tAvg_genes\tTotal_promoters\tAvg_promoters\tTotal_cCRE_promoters\tAvg_cCRE_promoters\tTotal_enhancers\tAvg_enhancers\tTotal_CTCF\tAvg_CTCF"
+
+    for(pair in loops) {
+
+        n=loops[pair]
+
+        printf "%s\t%d\t%d\t%.2f\t%d\t%.2f\t%d\t%.2f\t%d\t%.2f\t%d\t%.2f\n",
+
+        pair,
+        n,
+
+        genes[pair],
+        genes[pair]/n,
+
+        promoters[pair],
+        promoters[pair]/n,
+
+        ccre[pair],
+        ccre[pair]/n,
+
+        enhancers[pair],
+        enhancers[pair]/n,
+
+        ctcf[pair],
+        ctcf[pair]/n
+    }
+
+}' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort -k1,1 \
+> chr1_overlap_aware_anchor_pair_regulatory_burden.tsv
+
+# ============================================================
+# PRIORITIZE REGULATORY LOOPS
+# ============================================================
+
+# ============================================================
+# PRIORITIZE REGULATORY LOOPS
+# ============================================================
+
+# ------------------------------------------------------------
+# Identify the most enhancer-rich loops.
+#
+# Anchor1 enhancer count = column 14
+# Anchor2 enhancer count = column 15
+#
+# Total enhancer burden = $14 + $15
+# ------------------------------------------------------------
+
+{
+    head -1 chr1_loop_anchor_pair_CTCF_classified.tsv
+
+    tail -n +2 chr1_loop_anchor_pair_CTCF_classified.tsv |
+    awk -F'\t' 'BEGIN{OFS="\t"} {
+        print ($14+$15), $0
+    }' |
+    sort -t$'\t' -k1,1nr |
+    head -20 |
+    cut -f2-
+
+} > chr1_top20_enhancer_loops.tsv
+
+
+# ------------------------------------------------------------
+# Identify the most gene-rich loops.
+#
+# Anchor1 gene count = column 8
+# Anchor2 gene count = column 9
+#
+# Total gene burden = $8 + $9
+# ------------------------------------------------------------
+
+{
+    head -1 chr1_loop_anchor_pair_CTCF_classified.tsv
+
+    tail -n +2 chr1_loop_anchor_pair_CTCF_classified.tsv |
+    awk -F'\t' 'BEGIN{OFS="\t"} {
+        print ($8+$9), $0
+    }' |
+    sort -t$'\t' -k1,1nr |
+    head -20 |
+    cut -f2-
+
+} > chr1_top20_gene_loops.tsv
+
+
+# ============================================================
+# PROMOTER–ENHANCER LOOPS
+# ============================================================
+
+# ------------------------------------------------------------
+# Extract loops in which promoter and enhancer annotations
+# coexist across the two anchors.
+#
+# Anchor_pair_class = column 20
+#
+# Relevant overlap-aware categories:
+#
+#   PE
+#   P+E-E
+#   P+E-P
+#   P+E-O       <-- contains a P+E anchor, but NOT necessarily
+#                   a promoter-enhancer interaction across anchors
+#   P+E-P+E
+#
+# For a strict promoter-enhancer interaction, we retain:
+#
+#   PE
+#   P+E-E
+#   P+E-P
+#   P+E-P+E
+#
+# ------------------------------------------------------------
+
+awk -F'\t' '
+
+NR==1 ||
+$20=="PE" ||
+$20=="P+E-E" ||
+$20=="P+E-P" ||
+$20=="P+E-P+E"
+
+' chr1_loop_anchor_pair_CTCF_classified.tsv \
+> chr1_promoter_enhancer_loops.tsv
+
+# ============================================================
+# FINAL QC
+# ============================================================
+
+# ------------------------------------------------------------
+# Check:
+#
+#   1. Total number of loop rows
+#   2. Number of unique Loop IDs
+#   3. Number of duplicate Loop IDs
+#   4. Number of columns
+#   5. Whether the final table has the expected 21 columns
+#
+# Expected final structure:
+#
+#   1  Loop_ID
+#   2  Anchor1_chr
+#   3  Anchor1_start
+#   4  Anchor1_end
+#   5  Anchor2_chr
+#   6  Anchor2_start
+#   7  Anchor2_end
+#
+#   8  Anchor1_gene_count
+#   9  Anchor2_gene_count
+#   10 Anchor1_promoter_count
+#   11 Anchor2_promoter_count
+#   12 Anchor1_cCRE_promoter_count
+#   13 Anchor2_cCRE_promoter_count
+#   14 Anchor1_enhancer_count
+#   15 Anchor2_enhancer_count
+#   16 Anchor1_CTCF_count
+#   17 Anchor2_CTCF_count
+#
+#   18 Anchor1_type
+#   19 Anchor2_type
+#   20 Anchor_pair_class
+#   21 CTCF_status
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 1. TOTAL DATA ROWS
+# ------------------------------------------------------------
+
+TOTAL_ROWS=$(awk '
+NR>1 {n++}
+END {print n+0}
+' chr1_loop_anchor_pair_CTCF_classified.tsv)
+
+
+# ------------------------------------------------------------
+# 2. UNIQUE LOOP IDs
+# ------------------------------------------------------------
+
+UNIQUE_LOOPS=$(awk -F'\t' '
+NR>1 {
+    print $1
+}
+' chr1_loop_anchor_pair_CTCF_classified.tsv |
+sort -n |
+uniq |
+wc -l)
+
+
+# ------------------------------------------------------------
+# 3. DUPLICATE LOOP IDs
+# ------------------------------------------------------------
+
+DUPLICATES=$((TOTAL_ROWS-UNIQUE_LOOPS))
+
+
+# ------------------------------------------------------------
+# 4. NUMBER OF COLUMNS
+# ------------------------------------------------------------
+
+N_COLUMNS=$(awk -F'\t' '
+NR==1 {
+    print NF
+}
+' chr1_loop_anchor_pair_CTCF_classified.tsv)
+
+
+# ------------------------------------------------------------
+# 5. EXPECTED NUMBER OF COLUMNS
+# ------------------------------------------------------------
+
+EXPECTED_COLUMNS=21
+
+
+# ------------------------------------------------------------
+# PRINT QC RESULTS
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo "FINAL QC"
+echo "============================================================"
+
+echo "Final file      : chr1_loop_anchor_pair_CTCF_classified.tsv"
+echo "Total data rows : $TOTAL_ROWS"
+echo "Unique Loop IDs : $UNIQUE_LOOPS"
+echo "Duplicate IDs   : $DUPLICATES"
+echo "Columns         : $N_COLUMNS"
+echo "Expected columns: $EXPECTED_COLUMNS"
+
+
+# ------------------------------------------------------------
+# CHECK LOOP ID UNIQUENESS
+# ------------------------------------------------------------
+
+if [ "$TOTAL_ROWS" -eq "$UNIQUE_LOOPS" ] &&
+   [ "$DUPLICATES" -eq 0 ]; then
+
+    echo "Loop ID check   : PASS"
+
+else
+
+    echo "Loop ID check   : FAIL"
+
+fi
+
+
+# ------------------------------------------------------------
+# CHECK COLUMN NUMBER
+# ------------------------------------------------------------
+
+if [ "$N_COLUMNS" -eq "$EXPECTED_COLUMNS" ]; then
+
+    echo "Column check    : PASS"
+
+else
+
+    echo "Column check    : FAIL"
+
+fi
+
+
+# ------------------------------------------------------------
+# FINAL OVERALL STATUS
+# ------------------------------------------------------------
+
+if [ "$TOTAL_ROWS" -eq "$UNIQUE_LOOPS" ] &&
+   [ "$DUPLICATES" -eq 0 ] &&
+   [ "$N_COLUMNS" -eq "$EXPECTED_COLUMNS" ]; then
+
+    echo
+    echo "STATUS: PASS"
+    echo "Final table passed all structural QC checks."
+
+else
+
+    echo
+    echo "STATUS: FAIL"
+    echo "Final table requires investigation."
+
+fi
+
+
+# ============================================================
+# FINAL OUTPUTS
+# ============================================================
+
+echo
+echo "============================================================"
+echo "FINAL OUTPUT FILES"
+echo "============================================================"
+
+ls -lh \
+    "$FANC/inter_30_100kb.fanc" \
+    "$FANC/compartments_100kb" \
+    "$FANC/AB_compartments_100kb.bed" \
+    "$FANC/AB_domains_100kb.bed" \
+    "$FANC/compartment_strength_100kb.txt" \
+    "$FANC/enrichment_profile_100kb.pdf" \
+    "$HIC/chr1_pearsons_100kb.txt" \
+    "$LOOPS/inter_30_chr1_loops.bedpe" \
+    "$LOOPS/chr1_loop_integrated_summary.tsv" \
+    "$LOOPS/chr1_loop_anchor_pair_classified.tsv" \
+    "$LOOPS/chr1_loop_anchor_pair_CTCF_classified.tsv" \
+    "$LOOPS/chr1_anchor_pair_distribution.tsv" \
+    "$LOOPS/chr1_anchor_pair_CTCF_summary.tsv" \
+    "$LOOPS/chr1_overlap_aware_anchor_types.tsv" \
+    "$LOOPS/chr1_overlap_aware_anchor_pair_distribution.tsv" \
+    "$LOOPS/chr1_overlap_aware_anchor_pair_regulatory_burden.tsv" \
+    "$LOOPS/chr1_top20_enhancer_loops.tsv" \
+    "$LOOPS/chr1_top20_gene_loops.tsv" \
+    "$LOOPS/chr1_promoter_enhancer_loops.tsv"
+
+
+echo
+echo "============================================================"
+echo "HI-C DOWNSTREAM ANALYSIS COMPLETED"
+echo "============================================================"
+
+
+# ============================================================
+# CREATE FINAL WIDE LOOP-LEVEL ANNOTATED TABLE
+# ============================================================
+
+cd /mnt/d/hic/hic_project/downstream/loops
+
+# ------------------------------------------------------------
+# Output
+# ------------------------------------------------------------
+
+FINAL="chr1_final_loop_annotated.tsv"
+
+# ------------------------------------------------------------
+# Build the final table
+#
+# One row = one Loop_ID
+#
+# Multiple annotations for the same loop are combined using ;
+# Loops without an annotation are reported as NA.
+# ------------------------------------------------------------
+
+gawk 'BEGIN {
+    FS=OFS="\t"
+}
+
+# ------------------------------------------------------------
+# READ MASTER LOOP TABLE
+# ------------------------------------------------------------
+ARGIND==1 && NR>1 {
+
+    loop_id=$1
+
+    # Store original loop coordinates
+    chr1[loop_id]=$2
+    start1[loop_id]=$3
+    end1[loop_id]=$4
+
+    chr2[loop_id]=$5
+    start2[loop_id]=$6
+    end2[loop_id]=$7
+
+    loop_order[++n]=loop_id
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 1 GENES
+# ------------------------------------------------------------
+ARGIND==2 && NR>1 {
+
+    loop=$1
+    gene=$9
+
+    if (gene != "" && gene != "NA")
+        gene1[loop SUBSEP gene]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 2 GENES
+# ------------------------------------------------------------
+ARGIND==3 && NR>1 {
+
+    loop=$1
+    gene=$9
+
+    if (gene != "" && gene != "NA")
+        gene2[loop SUBSEP gene]=1
+
+    next
+}
+
+# ------------------------------------------------------------
+# ANCHOR 1 PROMOTERS
+# ------------------------------------------------------------
+ARGIND==4 && NR>1 {
+
+    loop=$1
+    gene=$9
+
+    if (gene != "" && gene != "NA")
+        promoter1[loop SUBSEP gene]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 2 PROMOTERS
+# ------------------------------------------------------------
+ARGIND==5 && NR>1 {
+
+    loop=$1
+    gene=$9
+
+    if (gene != "" && gene != "NA")
+        promoter2[loop SUBSEP gene]=1
+
+    next
+}
+
+# ------------------------------------------------------------
+# ANCHOR 1 ENHANCERS
+# ------------------------------------------------------------
+ARGIND==6 && NR>1 {
+
+    loop=$1
+
+    # cCRE_ID
+    ccre=$8
+
+    # Element_ID
+    element=$9
+
+    # Classification
+    class=$10
+
+    value=ccre "|" element "|" class
+
+    if (value != "")
+        enhancer1[loop SUBSEP value]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 2 ENHANCERS
+# ------------------------------------------------------------
+ARGIND==7 && NR>1 {
+
+    loop=$1
+
+    ccre=$8
+    element=$9
+    class=$10
+
+    value=ccre "|" element "|" class
+
+    if (value != "")
+        enhancer2[loop SUBSEP value]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 1 CTCF
+# ------------------------------------------------------------
+ARGIND==8 && NR>1 {
+
+    loop=$1
+
+    ccre=$8
+    element=$9
+    class=$10
+
+    value=ccre "|" element "|" class
+
+    if (value != "")
+        ctcf1[loop SUBSEP value]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# ANCHOR 2 CTCF
+# ------------------------------------------------------------
+ARGIND==9 && NR>1 {
+
+    loop=$1
+
+    ccre=$8
+    element=$9
+    class=$10
+
+    value=ccre "|" element "|" class
+
+    if (value != "")
+        ctcf2[loop SUBSEP value]=1
+
+    next
+}
+
+
+# ------------------------------------------------------------
+# FUNCTION TO COLLECT UNIQUE ANNOTATIONS
+# ------------------------------------------------------------
+function collect(arr, loop,    key, parts, result, first) {
+
+    result=""
+    first=1
+
+    for (key in arr) {
+
+        split(key, parts, SUBSEP)
+
+        if (parts[1] == loop) {
+
+            if (!first)
+                result=result";"
+
+            result=result parts[2]
+
+            first=0
+        }
+    }
+
+    if (result == "")
+        result="NA"
+
+    return result
+}
+
+
+# ------------------------------------------------------------
+# FUNCTION TO COUNT UNIQUE ANNOTATIONS
+# ------------------------------------------------------------
+function count_annotations(arr, loop,    key, parts, count) {
+
+    count=0
+
+    for (key in arr) {
+
+        split(key, parts, SUBSEP)
+
+        if (parts[1] == loop)
+            count++
+    }
+
+    return count
+}
+
+
+# ------------------------------------------------------------
+# FINAL OUTPUT
+# ------------------------------------------------------------
+END {
+
+    # Header
+
+    print \
+    "Loop_ID", \
+    "Anchor1_chr", \
+    "Anchor1_start", \
+    "Anchor1_end", \
+    "Anchor2_chr", \
+    "Anchor2_start", \
+    "Anchor2_end", \
+    "Anchor1_gene", \
+    "Anchor1_promoter", \
+    "Anchor1_enhancer", \
+    "Anchor1_CTCF", \
+    "Anchor2_gene", \
+    "Anchor2_promoter", \
+    "Anchor2_enhancer", \
+    "Anchor2_CTCF", \
+    "Anchor1_gene_count", \
+    "Anchor1_promoter_count", \
+    "Anchor1_enhancer_count", \
+    "Anchor1_CTCF_count", \
+    "Anchor2_gene_count", \
+    "Anchor2_promoter_count", \
+    "Anchor2_enhancer_count", \
+    "Anchor2_CTCF_count"
+
+
+    # One row for every original loop
+
+    for (i=1; i<=n; i++) {
+
+        loop=loop_order[i]
+
+        print \
+        loop, \
+        chr1[loop], \
+        start1[loop], \
+        end1[loop], \
+        chr2[loop], \
+        start2[loop], \
+        end2[loop], \
+
+        collect(gene1,loop), \
+        collect(promoter1,loop), \
+        collect(enhancer1,loop), \
+        collect(ctcf1,loop), \
+
+        collect(gene2,loop), \
+        collect(promoter2,loop), \
+        collect(enhancer2,loop), \
+        collect(ctcf2,loop), \
+
+        count_annotations(gene1,loop), \
+        count_annotations(promoter1,loop), \
+        count_annotations(enhancer1,loop), \
+        count_annotations(ctcf1,loop), \
+
+        count_annotations(gene2,loop), \
+        count_annotations(promoter2,loop), \
+        count_annotations(enhancer2,loop), \
+        count_annotations(ctcf2,loop)
+    }
+}
+' \
+chr1_loop_master.tsv \
+chr1_loop_anchor1_genes.tsv \
+chr1_loop_anchor2_genes.tsv \
+chr1_loop_anchor1_promoters.tsv \
+chr1_loop_anchor2_promoters.tsv \
+chr1_loop_anchor1_enhancers.tsv \
+chr1_loop_anchor2_enhancers.tsv \
+chr1_loop_anchor1_CTCF.tsv \
+chr1_loop_anchor2_CTCF.tsv \
+> "$FINAL"
+
+
+# ============================================================
+# CHECK FINAL FILE
+# ============================================================
+
+echo "============================================================"
+echo "FINAL ANNOTATED LOOP TABLE"
+echo "============================================================"
+
+echo "File:"
+echo "$LOOPS/$FINAL"
+
+echo
+echo "Number of loops:"
+tail -n +2 "$FINAL" | wc -l
+
+echo
+echo "Columns:"
+head -1 "$FINAL" | tr '\t' '\n' | nl
+
+echo
+echo "First 10 loops:"
+head -10 "$FINAL" | column -t -s $'\t'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
